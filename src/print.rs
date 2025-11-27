@@ -5,12 +5,13 @@ use regex::Regex;
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Write as FmtWrite};
 use std::io::{self, Write};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 use terminal_size::terminal_size;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 use crate::configs::PROMPT_ORDER;
 use crate::context::{Context, Properties, Shell, Target};
@@ -26,11 +27,7 @@ pub struct Grapheme<'a>(pub &'a str);
 
 impl Grapheme<'_> {
     pub fn width(&self) -> usize {
-        self.0
-            .chars()
-            .filter_map(UnicodeWidthChar::width)
-            .max()
-            .unwrap_or(0)
+        UnicodeWidthStr::width(self.0)
     }
 }
 
@@ -61,12 +58,14 @@ where
 
 #[test]
 fn test_grapheme_aware_width() {
-    // UnicodeWidthStr::width would return 8
     assert_eq!(2, "👩‍👩‍👦‍👦".width_graphemes());
     assert_eq!(1, "Ü".width_graphemes());
     assert_eq!(11, "normal text".width_graphemes());
     // Magenta string test
     assert_eq!(11, "\x1B[35;6mnormal text".width_graphemes());
+    // Variation selector 16 test (emoji presentation for symbols)
+    assert_eq!(1, "❄".width_graphemes());
+    assert_eq!(2, "❄️".width_graphemes());
 }
 
 pub fn prompt(args: Properties, target: Target) {
@@ -90,6 +89,8 @@ pub fn prompt_with_claude_code(args: Properties, target: Target) {
     write!(handle, "{}", get_prompt(&context)).unwrap();
 }
 
+const CLEAR_FROM_CURSOR_TO_END: &str = "\x1b[J";
+
 pub fn get_prompt(context: &Context) -> String {
     let config = &context.root_config;
     let mut buf = String::new();
@@ -105,8 +106,9 @@ pub fn get_prompt(context: &Context) -> String {
 
     // A workaround for a fish bug (see #739,#279). Applying it to all shells
     // breaks things (see #808,#824,#834). Should only be printed in fish.
-    if Shell::Fish == context.shell && context.target == Target::Main {
-        buf.push_str("\x1b[J"); // An ASCII control code to clear screen
+    let has_fish_clear_workaround = Shell::Fish == context.shell && context.target == Target::Main;
+    if has_fish_clear_workaround {
+        buf.push_str(CLEAR_FROM_CURSOR_TO_END);
     }
 
     let (formatter, modules) = load_formatter_and_modules(context);
@@ -163,6 +165,57 @@ pub fn get_prompt(context: &Context) -> String {
         buf = buf.replace('!', "\\!");
         // space is required before newline
         buf = buf.replace('\n', " \\n");
+    }
+
+    if context.shell == Shell::Fish && context.width > 0 && context.target == Target::Main {
+        let mut new_buf = String::with_capacity(buf.len());
+        let mut len = 0;
+
+        let mut push_wrapped_text = |range: Range<usize>, new_buf: &mut String| {
+            for g in buf[range].graphemes(true) {
+                let mut newline = g == "\n" || g == "\r\n";
+                let width = if !newline { Grapheme(g).width() } else { 0 };
+
+                if width > 0 && len > 0 && len + width > context.width {
+                    new_buf.push('\n');
+                    newline = true;
+                }
+
+                new_buf.push_str(g);
+                len = if !newline { len + width } else { width };
+            }
+        };
+
+        let prefix_range = if has_fish_clear_workaround {
+            0..CLEAR_FROM_CURSOR_TO_END.len()
+        } else {
+            0..0
+        };
+
+        let ansi_ranges = std::iter::once(prefix_range.clone()).chain(
+            ansi_strip()
+                .find_iter(&buf)
+                .map(|m| m.range())
+                .filter(|r| r.start >= prefix_range.end),
+        );
+
+        let mut previous_end = 0;
+        for current in ansi_ranges {
+            if previous_end < current.start {
+                push_wrapped_text(
+                    previous_end.max(prefix_range.end)..current.start,
+                    &mut new_buf,
+                );
+            }
+            previous_end = current.end;
+            new_buf.push_str(&buf[current]);
+        }
+
+        if previous_end < buf.len() {
+            push_wrapped_text(previous_end..buf.len(), &mut new_buf);
+        }
+
+        buf = new_buf;
     }
 
     buf
@@ -841,6 +894,59 @@ mod test {
         context.target = Target::Profile("claude-code".to_string());
 
         let expected = "user profile";
+        let actual = get_prompt(&context);
+        assert_eq!(expected, actual);
+    }
+
+    fn wraps_prompt_on_fish_shell_with_colors_at_start_and_middle() {
+        let mut context = default_context().set_config(toml::toml! {
+                add_newline=false
+                format="$character"
+                [character]
+                format="[ab](fg:purple)cdef\n🫨🙏😺[test](fg:cyan)\n🙈🙉🙊❄✈☢❄✈☢❄️✈️☢️>\n>"
+        });
+        context.target = Target::Main;
+        context.shell = Shell::Fish;
+        context.width = 6;
+
+        let expected = CLEAR_FROM_CURSOR_TO_END.to_owned()
+            + "\u{1b}[35mab\u{1b}[0mcdef\n🫨🙏😺\u{1b}[36m\ntest\u{1b}[0m\n🙈🙉🙊\n❄✈☢❄✈☢\n❄️✈️☢️\n>\n>";
+        let actual = get_prompt(&context);
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn wraps_prompt_on_fish_shell_with_colors_in_middle_only() {
+        let mut context = default_context().set_config(toml::toml! {
+                add_newline=false
+                format="$character"
+                [character]
+                format="abcdef\n🫨🙏😺[test](fg:cyan)\n🙈🙉🙊❄✈☢❄✈☢❄️✈️☢️>\n>"
+        });
+        context.target = Target::Main;
+        context.shell = Shell::Fish;
+        context.width = 6;
+
+        let expected = CLEAR_FROM_CURSOR_TO_END.to_owned()
+            + "abcdef\n🫨🙏😺\u{1b}[36m\ntest\u{1b}[0m\n🙈🙉🙊\n❄✈☢❄✈☢\n❄️✈️☢️\n>\n>";
+        let actual = get_prompt(&context);
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn wraps_prompt_on_fish_shell_with_colors_at_end_only() {
+        let mut context = default_context().set_config(toml::toml! {
+                add_newline=false
+                format="$character"
+                [character]
+                format="abcdef\n🫨🙏😺test\n🙈🙉🙊❄✈☢❄✈☢❄️✈️☢️>\n[>](fg:purple)"
+        });
+        context.target = Target::Main;
+        context.shell = Shell::Fish;
+        context.width = 6;
+
+        let expected = CLEAR_FROM_CURSOR_TO_END.to_owned()
+            + "abcdef\n🫨🙏😺\ntest\n🙈🙉🙊\n❄✈☢❄✈☢\n❄️✈️☢️\n>\n\u{1b}[35m>\u{1b}[0m";
         let actual = get_prompt(&context);
         assert_eq!(expected, actual);
     }
