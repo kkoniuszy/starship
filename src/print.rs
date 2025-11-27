@@ -97,7 +97,9 @@ pub fn get_prompt(context: &Context) -> String {
 
     // A workaround for a fish bug (see #739,#279). Applying it to all shells
     // breaks things (see #808,#824,#834). Should only be printed in fish.
-    let has_fish_clear_workaround = Shell::Fish == context.shell && context.target == Target::Main;
+    let has_fish_clear_workaround = Shell::Fish == context.shell
+        && context.target == Target::Main
+        && context.get_env("STARSHIP_FISH_NEEDS_CLEAR") == Some("1".to_string());
     if has_fish_clear_workaround {
         buf.push_str(CLEAR_FROM_CURSOR_TO_END);
     }
@@ -900,8 +902,14 @@ mod test {
         context.shell = Shell::Fish;
         context.width = 6;
 
-        let expected = CLEAR_FROM_CURSOR_TO_END.to_owned()
-            + "\u{1b}[35mab\u{1b}[0mcdef\n🫨🙏😺\u{1b}[36m\ntest\u{1b}[0m\n🙈🙉🙊\n❄✈☢❄✈☢\n❄️✈️☢️\n>\n>";
+        let expected = "\u{1b}[35mab\u{1b}[0mcdef\n🫨🙏😺\u{1b}[36m\ntest\u{1b}[0m\n🙈🙉🙊\n❄✈☢❄✈☢\n❄️✈️☢️\n>\n>";
+        let actual = get_prompt(&context);
+        assert_eq!(expected, actual);
+
+        context
+            .env
+            .insert("STARSHIP_FISH_NEEDS_CLEAR", "1".to_string());
+        let expected = CLEAR_FROM_CURSOR_TO_END.to_owned() + expected;
         let actual = get_prompt(&context);
         assert_eq!(expected, actual);
     }
@@ -918,8 +926,14 @@ mod test {
         context.shell = Shell::Fish;
         context.width = 6;
 
-        let expected = CLEAR_FROM_CURSOR_TO_END.to_owned()
-            + "abcdef\n🫨🙏😺\u{1b}[36m\ntest\u{1b}[0m\n🙈🙉🙊\n❄✈☢❄✈☢\n❄️✈️☢️\n>\n>";
+        let expected = "abcdef\n🫨🙏😺\u{1b}[36m\ntest\u{1b}[0m\n🙈🙉🙊\n❄✈☢❄✈☢\n❄️✈️☢️\n>\n>";
+        let actual = get_prompt(&context);
+        assert_eq!(expected, actual);
+
+        context
+            .env
+            .insert("STARSHIP_FISH_NEEDS_CLEAR", "1".to_string());
+        let expected = CLEAR_FROM_CURSOR_TO_END.to_owned() + expected;
         let actual = get_prompt(&context);
         assert_eq!(expected, actual);
     }
@@ -936,8 +950,14 @@ mod test {
         context.shell = Shell::Fish;
         context.width = 6;
 
-        let expected = CLEAR_FROM_CURSOR_TO_END.to_owned()
-            + "abcdef\n🫨🙏😺\ntest\n🙈🙉🙊\n❄✈☢❄✈☢\n❄️✈️☢️\n>\n\u{1b}[35m>\u{1b}[0m";
+        let expected = "abcdef\n🫨🙏😺\ntest\n🙈🙉🙊\n❄✈☢❄✈☢\n❄️✈️☢️\n>\n\u{1b}[35m>\u{1b}[0m";
+        let actual = get_prompt(&context);
+        assert_eq!(expected, actual);
+
+        context
+            .env
+            .insert("STARSHIP_FISH_NEEDS_CLEAR", "1".to_string());
+        let expected = CLEAR_FROM_CURSOR_TO_END.to_owned() + expected;
         let actual = get_prompt(&context);
         assert_eq!(expected, actual);
     }
